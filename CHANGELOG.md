@@ -6,6 +6,8 @@ All notable changes to Vibe are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-05
+
 ### Added
 - 8-line feedback delay network reverb with Wet and Time (0.3–20 s) knobs.
 - Micro-looper: Record footswitch for the first take and overdubs, Clear, Loop level, and Speed
@@ -14,4 +16,5 @@ All notable changes to Vibe are documented here. The format follows
 - Bypass footswitch with a click-free crossfade and host bypass integration.
 - Hand-drawn pedal GUI, resizable, with record/loop status LEDs.
 
-[Unreleased]: https://github.com/accraze/vibe/commits/main
+[Unreleased]: https://github.com/accraze/vibe/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/accraze/vibe/releases/tag/v0.1.0
