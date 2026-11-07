@@ -7,11 +7,12 @@
 //!    Clock runs the looper at a lower internal rate: longer loops, more grit, same pitch.
 //! 3. Output: dry + reverb + loop.
 
+use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 mod editor;
 
@@ -126,12 +127,22 @@ struct Looper {
 }
 
 impl Looper {
-    /// Allocates, so call it from `initialize()` only.
+    #[cfg(test)]
     fn new(fs: f32) -> Self {
+        let mut lp = Self::default();
+        lp.fit(fs);
+        lp
+    }
+
+    /// Sizes the buffer for a sample rate, keeping whatever loop fits. Allocates.
+    fn fit(&mut self, fs: f32) {
         let cells = (LOOP_SECONDS * fs) as usize;
-        Self {
-            buf: [vec![0.0; cells], vec![0.0; cells]],
-            ..Self::default()
+        for b in &mut self.buf {
+            b.resize(cells, 0.0);
+        }
+        self.len = self.len.min(cells);
+        if self.pos >= self.len as f32 {
+            self.pos = 0.0;
         }
     }
 
@@ -221,6 +232,103 @@ impl Looper {
     }
 }
 
+/// The looper, shared by the audio thread and the plugin state so the loop is saved with the project.
+#[derive(Default)]
+struct LoopStore(Mutex<Looper>);
+
+impl LoopStore {
+    /// Only contended while the host saves or loads state, for one copy of the loop.
+    fn lock(&self) -> MutexGuard<'_, Looper> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Saved as the left and right loop cells, base64 little-endian f32.
+impl<'a> PersistentField<'a, [String; 2]> for LoopStore {
+    fn set(&self, saved: [String; 2]) {
+        // A loop that doesn't decode is dropped rather than half-loaded
+        let (Some(mut l), Some(mut r)) = (decode(&saved[0]), decode(&saved[1])) else {
+            return;
+        };
+        let len = l.len().min(r.len());
+        l.truncate(len);
+        r.truncate(len);
+        // Restored at whatever rate it was recorded; initialize() sizes the buffer back up
+        let mut lp = self.lock();
+        lp.buf = [l, r];
+        lp.len = len;
+        lp.pos = 0.0;
+        lp.taking = false;
+    }
+
+    fn map<F, R>(&self, f: F) -> R
+    where
+        F: Fn(&[String; 2]) -> R,
+    {
+        // Copy under the lock, encode after, so the audio thread waits as little as possible
+        let cells = {
+            let lp = self.lock();
+            lp.buf.clone().map(|mut b| {
+                b.truncate(lp.len);
+                b
+            })
+        };
+        f(&cells.map(|b| encode(&b)))
+    }
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn encode(x: &[f32]) -> String {
+    let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for k in 0..4 {
+            s.push(if k <= c.len() {
+                B64[(n >> (18 - 6 * k) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    s
+}
+
+/// `None` unless it's whole finite samples, since it comes from a project file.
+fn decode(s: &str) -> Option<Vec<f32>> {
+    let mut bytes = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut n, mut bits) = (0u32, 0);
+    for ch in s.trim_end_matches('=').bytes() {
+        let v = match ch {
+            b'A'..=b'Z' => ch - b'A',
+            b'a'..=b'z' => ch - b'a' + 26,
+            b'0'..=b'9' => ch - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        n = (n << 6 | v as u32) & 0xffff;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((n >> bits) as u8);
+        }
+    }
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let x: Vec<f32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| f32::from_le_bytes(b))
+        .collect();
+    x.iter().all(|v| v.is_finite()).then_some(x)
+}
+
 /// Maps the Clock knob (0..1) to the looper rate as a fraction of the host rate, an octave per third.
 fn clock_rate(clock: f32) -> f32 {
     CLOCK_MIN.powf(1.0 - clock)
@@ -244,7 +352,6 @@ struct Vibe {
     shared: Arc<Shared>,
     sample_rate: f32,
     reverb: Reverb,
-    looper: Looper,
     /// 0 = bypassed, 1 = fully processed
     wet: f32,
 }
@@ -253,6 +360,8 @@ struct Vibe {
 struct VibeParams {
     #[persist = "editor-size"]
     editor_state: Arc<EguiState>,
+    #[persist = "loop"]
+    looper: LoopStore,
 
     #[id = "time"]
     time: FloatParam,
@@ -282,6 +391,7 @@ impl Default for VibeParams {
     fn default() -> Self {
         Self {
             editor_state: EguiState::from_size(editor::WIDTH, editor::HEIGHT),
+            looper: LoopStore::default(),
             time: knob("Time", 0.5)
                 .with_unit(" s")
                 .with_value_to_string(Arc::new(|v| format!("{:.1}", time_to_t60(v))))
@@ -317,7 +427,6 @@ impl Default for Vibe {
             shared: Arc::new(Shared::default()),
             sample_rate: 48000.0,
             reverb: Reverb::default(),
-            looper: Looper::default(),
             wet: 1.0,
         }
     }
@@ -365,14 +474,15 @@ impl Plugin for Vibe {
         // Buffers are allocated here because reset() can run on the audio thread
         self.sample_rate = buffer_config.sample_rate;
         self.reverb = Reverb::new(self.sample_rate);
-        self.looper = Looper::new(self.sample_rate);
+        // Keeps a loop restored from the project
+        self.params.looper.lock().fit(self.sample_rate);
         self.reset();
         true
     }
 
+    /// Leaves the loop alone: it belongs to the project, not to playback.
     fn reset(&mut self) {
         self.reverb.clear();
-        self.looper.clear();
         self.wet = if self.params.bypass.value() { 0.0 } else { 1.0 };
     }
 
@@ -382,8 +492,9 @@ impl Plugin for Vibe {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        let mut looper = self.params.looper.lock();
         if self.shared.clear.swap(false, Ordering::Relaxed) {
-            self.looper.clear();
+            looper.clear();
         }
         let fade_step = 1.0 / (BYPASS_FADE * self.sample_rate);
 
@@ -409,9 +520,7 @@ impl Plugin for Vibe {
             // Keep processing while bypassed so the tail and loop carry on underneath
             let verb = self.reverb.process([l, r], &gains);
             let pre = [l + verb[0] * wet_level, r + verb[1] * wet_level];
-            let lp = self
-                .looper
-                .process(pre, self.params.record.value(), speed, rate);
+            let lp = looper.process(pre, self.params.record.value(), speed, rate);
             let out = [0, 1].map(|c| pre[c] + lp[c] * loop_level);
 
             for (c, sample) in frame.iter_mut().enumerate() {
@@ -421,7 +530,7 @@ impl Plugin for Vibe {
         }
         self.shared
             .has_loop
-            .store(self.looper.has_loop(), Ordering::Relaxed);
+            .store(looper.has_loop(), Ordering::Relaxed);
 
         ProcessStatus::Normal
     }
@@ -575,6 +684,36 @@ mod tests {
         assert!(lp.buf[0][SEAM_FADE..4800 - SEAM_FADE]
             .iter()
             .all(|&y| y > mid * OVERDUB_DECAY + 0.09));
+    }
+
+    #[test]
+    fn loop_survives_save_and_load() {
+        let take = sine(440.0, 4800);
+        let (lp, _) = record_and_play(&take, 1.0, 1.0, 1);
+        let saved = LoopStore(Mutex::new(lp));
+        let json = saved
+            .map(nih_plug::params::persist::serialize_field)
+            .unwrap();
+        println!("4800-cell loop saves as {} bytes", json.len());
+
+        let loaded = LoopStore::default();
+        loaded.set(nih_plug::params::persist::deserialize_field(&json).unwrap());
+        // Reopened at a higher rate: the buffer grows, the loop stays
+        loaded.lock().fit(96000.0);
+        let (a, b) = (saved.lock(), loaded.lock());
+        assert_eq!(b.len, 4800);
+        assert_eq!(b.buf[0].len(), (LOOP_SECONDS * 96000.0) as usize);
+        assert_eq!(a.buf[0][..4800], b.buf[0][..4800]);
+        assert_eq!(a.buf[1][..4800], b.buf[1][..4800]);
+
+        // Odd lengths round-trip, and junk or non-finite data is refused
+        for n in 0..4 {
+            let x: Vec<f32> = (0..n).map(|i| i as f32 - 1.5).collect();
+            assert_eq!(decode(&encode(&x)).unwrap(), x);
+        }
+        assert!(decode("not base64!").is_none());
+        assert!(decode("AAA").is_none());
+        assert!(decode(&encode(&[f32::NAN])).is_none());
     }
 
     #[test]

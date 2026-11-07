@@ -31,7 +31,10 @@ cargo clippy --release --lib
   Cells are written sample-and-hold with no anti-alias filter on purpose (low Clock grit).
 - Reverb and loop buffers are allocated in `initialize()`, because `reset()` can run on the audio thread.
 - `Shared` (an `Arc` shared with the editor) carries the Clear request and whether a loop exists (for the LED).
-  The loop audio isn't part of the plugin state, so it's lost when the project closes.
+- The `Looper` lives in `VibeParams::looper` (a `LoopStore` mutex) so it's saved as plugin state: the
+  `PersistentField` impl copies the loop under the lock, then base64-encodes it outside it. `process()` holds
+  the lock per block; it's only contended during a state save/load. `initialize()` calls `fit()`, which keeps a
+  restored loop, and `reset()` deliberately doesn't touch the loop.
 - GUI lives in `src/editor.rs`: a hand-painted pedal. `knob()`, `screw()`, `footswitch()` and window scaling
   come from Rodent (see `../rodent/CLAUDE.md`). Drag or mouse wheel to turn (2%/notch), Shift for fine,
   double-click resets.

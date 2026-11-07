@@ -19,7 +19,8 @@ Clock to run the looper at a lower sample rate for longer, grittier loops.
 | Record     | Tap to start the first take, tap again to close the loop. Later taps overdub. The LED is red while recording and green while a loop plays |
 | Bypass     | The LED is lit when the effect is on. The loop and reverb keep running underneath |
 
-The loop holds 20 s at full Clock, up to 160 s at the lowest. It isn't saved with the project.
+The loop holds 20 s at full Clock, up to 160 s at the lowest. It's saved with the project, so it's
+still there when you reopen it (a full 20 s loop adds about 10 MB to the project).
 
 Knobs: drag or scroll to turn, hold Shift for fine control, double-click to reset.
 Drag the bottom-right corner to resize the window.

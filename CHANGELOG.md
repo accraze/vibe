@@ -6,6 +6,12 @@ All notable changes to Vibe are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- The loop is saved with the project and comes back when you reopen it.
+
+### Changed
+- A host reset (such as a transport jump) no longer erases the loop.
+
 ## [0.1.0] - 2026-11-05
 
 ### Added
